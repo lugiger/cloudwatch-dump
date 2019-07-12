@@ -1,13 +1,12 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
+import json
+import pickle
 
+import boto3
+from typing import List
 from datetime import timedelta
-from dateutil.tz import tzlocal
-from boto import ec2
-from boto.ec2 import cloudwatch
 from util import RichDateTime
-
-VERSION = 'cloudwatch-dump %s' % __import__('cloudwatch_dump').__version__
 
 
 def get_time_range(time_str, interval):
@@ -24,116 +23,93 @@ def get_time_range(time_str, interval):
     return t, RichDateTime.from_datetime(t + d)
 
 
-def get_metrics(region):
+def get_metrics(region: str, namespace: str, dimensions: List[dict]):
     """
     Get all metrics in specified region.
     """
-    client = cloudwatch.connect_to_region(region)
+    client = boto3.client('cloudwatch')
     if not client:
         raise Exception('Failed to connect to region: %s' % region)
     buf = []
     next_token = None
     while True:
         if next_token:
-            result = client.list_metrics(next_token=next_token)
+            result = client.list_metrics(Namespace=namespace,
+                                         Dimensions=dimensions,
+                                         NextToken=next_token)
         else:
-            result = client.list_metrics()
-        buf += list(result)
-        if not result.next_token:
+            result = client.list_metrics(Dimensions=dimensions, Namespace=namespace)
+        buf += list(result.get('Metrics'))
+        if not result.get('next_token'):
             break
         next_token = result.next_token
     return buf
 
 
-def metric_to_tag(metric, statistics, ec2_names):
-    """
-    Create tag string from metric and statistics.
-    """
-    buf = []
-    buf.append(metric.connection.region.name)
-    buf.append(statistics)
-    buf += metric.namespace.split('/')
-    for x in sorted(metric.dimensions.items()):
-        # replace slash for whisper safety
-        buf += ('root' if s == '/' else ec2_names.get(s, s).replace('/', '_') for s in x[1])
-    buf.append(metric.name)
-    return '.'.join(buf)
-
-
-def get_metric_statistics(metric, start_time, end_time, statistics, unit, period):
-    """
-    Execute CloudWatch API to fetch statistics data.
-    """
-    # query with utc
-    datapoints = metric.query(start_time.to_utc(), end_time.to_utc(), statistics, unit, period)
-
-    def f(datapoint):
-        # read timestamp as local time
-        t = RichDateTime.from_datetime(datapoint['Timestamp'], tzlocal())
-        return metric, statistics, datapoint[statistics], t
-
-    return map(f, datapoints)
-
-
-def get_data(metrics, statistics_list, start, end, period_in_min):
+def get_data(metrics, statistics_list, start, end, period_in_sec):
     """
     Get summerized CloudWatch metric status,
     then generate tuples of metric, statistics, value, and timestamp in UTC.
     """
-    p = timedelta(minutes=period_in_min)
+    client = boto3.client('cloudwatch')
+    if not client:
+        raise Exception('Failed to connect')
 
-    params = ((m, start, end, s, None, p.seconds) for m in metrics for s in statistics_list)
-    return (data for param in params for data in get_metric_statistics(*param))
+    p = timedelta(minutes=period_in_sec)
 
+    metric_data = [{'Id': f'{stat.lower()}{index}', 'MetricStat': {'Metric': metric, 'Period': period_in_sec, 'Stat': stat}} for index, metric in enumerate(metrics) for stat in statistics_list]
 
-def get_ec2_names(region):
-    """
-    Get dictionary of the instance id and the name from all the EC2 instances.
-    """
-    client = ec2.connect_to_region(region)
-    instances = [x for r in client.get_all_instances() for x in r.instances]
-    return dict((x.id, x.tags.get('Name')) for x in instances if x.tags.get('Name'))
+    data = client.get_metric_data(
+        MetricDataQueries=metric_data,
+        StartTime=start,
+        EndTime=end,
+    )
 
-
-def print_data(data, ec2_names):
-    """
-    Output value of one datapoint.
-    Timestamp is converted to localtime.
-    """
-    m, s, v, t = data
-    print('%s %.10f %d' % (metric_to_tag(m, s, ec2_names), v, t.to_local().epoch()))
+    return [{'Data': datapoint, 'Metric': metric_data[index]['MetricStat']['Metric'] } for index, datapoint in enumerate(data['MetricDataResults'])]
 
 
 def parse_args():
     """
     Parse command line arguments
     """
-    from optparse import OptionParser
+    from argparse import ArgumentParser
 
-    parser = OptionParser(version=VERSION)
-    parser.add_option(
-        '--region', dest='region', default='us-east-1', type='string',
+    parser = ArgumentParser()
+    parser.add_argument(
+        '--region', dest='region', default='us-east-1', type=str,
         help='the name of the region to connect to'
     )
-    parser.add_option(
-        '--time', dest='time', default=None, type='string',
+    parser.add_argument(
+        '--time', dest='time', default=None, type=str,
         help='start time of the query in format "YYYYMMDDhhmm" localtime'
     )
-    parser.add_option(
-        '--interval', dest='interval', default=60, type='int',
+    parser.add_argument(
+        '--interval', dest='interval', default=60, type=int,
         help='minutes of time range in the query'
     )
-    parser.add_option(
-        '--period', dest='period', default=5, type='int',
-        help='minutes to aggregate in the query'
+    parser.add_argument(
+        '--period', dest='period', default=60, type=int,
+        help='seconds to aggregate in the query'
     )
-    parser.add_option(
+    parser.add_argument(
         '--resolve', action='store_true', dest='resolve', default=False,
         help='replaces name tag value for EC2 instances instead of the instance id (default: False)'
     )
-    parser.add_option(
+    parser.add_argument(
         '--check', action='store_true', dest='check', default=False,
         help='prints only the metrics and its statistics methods (default: False)'
+    )
+    parser.add_argument(
+        '--namespace', dest='namespace', default='', type=str,
+        help='metrics namespace to dump (default: all namespaces)'
+    )
+    parser.add_argument(
+        '--dimensions', dest='dimensions', type=json.loads,
+        help='Filter metrics, usage: {"Name":"STRING","Value":"STRING"}'
+    )
+    parser.add_argument(
+        '--filename', dest='filename', type=str,
+        help='File to save data'
     )
     return parser.parse_args()
 
@@ -145,30 +121,29 @@ def main():
     statistics_list = ['Average', 'Sum']
 
     # get command line arguments
-    options, args = parse_args()
+    options = parse_args()
 
     # calculate time range
     start, end = get_time_range(options.time, options.interval)
 
     # get metrics list
-    metrics = get_metrics(options.region)
+    metrics = get_metrics(options.region, options.namespace, options.dimensions)
     query_params = ((m, s) for m in metrics for s in statistics_list)
-
-    # get ec2 names resolver
-    ec2_names = get_ec2_names(options.region) if options.resolve else {}
 
     if options.check:
         # print all query params when check mode
         print('start : %s' % start)
         print('end   : %s' % end)
         print('period: %s min' % options.period)
-        print('ec2 names: %s' % ec2_names)
         for q in query_params:
-            print('will collect metric: %s' % (metric_to_tag(q[0], q[1], ec2_names)))
+            print('will collect metric: %s %s' % (q[0], q[1]))
     else:
         # fetch and print metrics statistics
-        for data in get_data(metrics, statistics_list, start, end, options.period):
-            print_data(data, ec2_names)
+        data = get_data(metrics, statistics_list, start, end, options.period)
+        with open(options.filename, 'wb') as f:
+            pickle.dump(data, f)
+            print('Wrote results to file: %s' % options.filename)
+            print(data)
     return 0
 
 
